@@ -16,7 +16,6 @@ Usage:
 
 import os
 import sys
-import math
 import argparse
 import logging
 from pathlib import Path
@@ -59,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="split mode",
     )
+    sp.add_argument("--min_len",    type=int, default=50,  help="minimum chunk length in chars (default: 50)")
+    sp.add_argument("--chunk_size", type=int, default=512, help="char-mode window size in chars (default: 512)")
+    sp.add_argument("--chunk_step", type=int, default=256, help="char-mode stride in chars (default: 256)")
+    sp.add_argument("--no_unicode", action="store_true",   help="strip non-ASCII characters (default: keep unicode)")
     sp.add_argument("--config", default="config.yaml", help="config.yaml path")
 
     # ── train ─────────────────────────────────────────────────────────────────
@@ -124,7 +127,11 @@ def cmd_split(args) -> None:
         seed=args.seed,
         shuffle=not args.no_shuffle,
         dedupe=args.dedupe,
+        min_len=args.min_len,
+        chunk_size=args.chunk_size,
+        chunk_step=args.chunk_step,
         mode=args.mode,
+        keep_unicode=not args.no_unicode,
     )
 
 
