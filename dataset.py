@@ -227,11 +227,18 @@ class TokenizedDataset(Dataset):
 
             if cached.exists():
                 logger.info("Cache hit  -> %s", cached.name)
-                tokens = torch.load(cached, weights_only=True)
-                logger.info(
-                    "Loaded %s tokens from cache", f"{len(tokens):,}"
-                )
-                return tokens
+                try:
+                    tokens = torch.load(cached, weights_only=True)
+                    logger.info(
+                        "Loaded %s tokens from cache", f"{len(tokens):,}"
+                    )
+                    return tokens
+                except Exception as e:
+                    # W-7: corrupted cache — fall through to re-tokenize
+                    logger.warning(
+                        "Cache load failed for %s (%s) — re-tokenizing.",
+                        cached.name, e,
+                    )
 
         # ── Tokenize fresh ────────────────────────────────────────────────────
         logger.info("Tokenizing %s ...", path.name)
@@ -332,6 +339,7 @@ def get_dataloaders(
     seed:        int           = 42,
     cache_dir:   Optional[str] = "out/tokenized_cache",
     pad_id:      int           = 0,
+    pin_memory:  Optional[bool] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader]]:
     """
     Build train / val / test DataLoaders.
@@ -360,8 +368,8 @@ def get_dataloaders(
         (train_dl, val_dl, test_dl)
         val_dl and test_dl are None if not provided
     """
-    # ── CUDA check for pin_memory ─────────────────────────────────────────────
-    pin = torch.cuda.is_available()
+    # W-11: use config value when provided; auto-detect CUDA only as fallback
+    pin = pin_memory if pin_memory is not None else torch.cuda.is_available()
 
     def collate(batch):
         return slm_collate_fn(batch, pad_id=pad_id)
