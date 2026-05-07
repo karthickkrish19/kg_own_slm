@@ -11,7 +11,6 @@ class Config:
     tokenized_cache_dir:   Optional[str]   = "out/tokenized_cache"
     model_save_dir:        str             = "out/checkpoints"
     log_dir:               str             = "out/logs"
-    embeddings_save_path:  Optional[str]   = "out/embeddings.pt"
 
     # Tokenizer
     vocab_size:                  int        = 50000
@@ -28,13 +27,9 @@ class Config:
     # Data
     block_size:              int            = 256
     train_stride:            int            = 128
+    # Tokenizer is trained on these files (should be full corpus, not just train split)
     tokenizer_corpus_files:  Optional[List[str]] = None
-    val_split:               float          = 0.05
-    streaming:               bool           = False
-    shuffle_buffer:          int            = 10000
-    steps_per_epoch:         Optional[int]  = None
-    deduplicate_text:        bool           = False
-    dedup_bloom_error_rate:  float          = 0.01
+    val_file:                Optional[str]  = "data/val.txt"
 
     # Training
     batch_size:          int            = 16
@@ -42,12 +37,8 @@ class Config:
     grad_accum_steps:    int            = 2
     learning_rate:       float          = 3e-4
     min_lr:              float          = 3e-5
-    lr_schedule:         bool           = True
     warmup_steps:        int            = 200
     weight_decay:        float          = 0.1
-    no_decay_params:     List[str]      = field(
-        default_factory=lambda: ["bias", "norm.weight", "norm1.weight", "norm2.weight"]
-    )
     label_smoothing:     float          = 0.1
     gradient_clip:       float          = 1.0
     log_every:           int            = 100
@@ -61,7 +52,6 @@ class Config:
     num_heads:              int            = 8
     num_kv_heads:           int            = 2
     num_layers:             int            = 8
-    head_dim:               Optional[int]  = None
     dropout:                float          = 0.1
     attn_dropout:           float          = 0.05
     ffn_dropout:            float          = 0.1
@@ -94,7 +84,6 @@ class Config:
 
     # Hardware
     seed:              int   = 42
-    distributed:       bool  = False
     mixed_precision:   str   = "auto"
     num_workers:       int   = 0
     pin_memory:        bool  = False
@@ -117,13 +106,13 @@ class Config:
     rag_embedding_layer:       str   = "mean"
     rag_embedding_normalize:   bool  = True
     rag_embedding_batch_size:  int   = 32
-    rag_embedding_projection:  bool  = False
     rag_cache_size:            int   = 1000
 
     # API
-    api_host:              str            = "0.0.0.0"
+    api_host:              str            = "127.0.0.1"
     api_port:              int            = 8000
     api_key:               Optional[str]  = None
+    api_cors_origins:      List[str]      = field(default_factory=lambda: ["http://localhost:3000"])
     rate_limit_per_minute: int            = 60
 
     @classmethod
@@ -142,11 +131,8 @@ class Config:
             yaml.dump(self.__dict__, f, default_flow_style=False, sort_keys=False)
 
     def __post_init__(self):
-        if self.head_dim is None:
-            self.head_dim = self.embed_dim // self.num_heads
         assert self.embed_dim % self.num_heads == 0, \
             f"embed_dim {self.embed_dim} not divisible by num_heads {self.num_heads}"
         assert self.block_size > 0,          "block_size must be > 0"
-        assert 0.0 <= self.val_split < 1.0,  "val_split must be in [0, 1)"
         assert self.num_heads % self.num_kv_heads == 0, \
             f"num_heads {self.num_heads} must be divisible by num_kv_heads {self.num_kv_heads}"
