@@ -20,13 +20,14 @@ Usage:
 
 import os
 import re
+import json
 import time
-import pickle
 import logging
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +119,10 @@ class ModelEmbedder:
         seq_len = self.model.config.max_seq_len
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i : i + self.batch_size]
+            # W-3: must match training — model was trained without BOS/EOS
             encoded = self.tokenizer.batch_encode(
-                batch, max_len=seq_len, pad=True, truncate=True
+                batch, max_len=seq_len, pad=True, truncate=True,
+                add_special_tokens=False,
             )
             ids_list = encoded["input_ids"]
             inp = torch.tensor(ids_list, dtype=torch.long, device=self.device)
@@ -172,15 +175,17 @@ class VectorStore:
         self.path = path
         self.lock = threading.Lock()
 
-        if path and Path(path + ".index").exists():
+        # Trigger load when meta file exists (covers both FAISS and numpy stores)
+        if path and Path(path + ".meta").exists():
             self._load(path)
         else:
             self._create_index()
 
     def _create_index(self) -> None:
+        # W-1: always initialize so attribute exists regardless of FAISS
+        self._numpy_store = None
+        self.index = None
         if not FAISS_AVAILABLE:
-            self.index = None
-            self._numpy_store = None
             return
         if self.index_type == "flat":
             self.index = faiss.IndexFlatIP(self.dim)
@@ -231,18 +236,20 @@ class VectorStore:
             query = query_emb.astype(np.float32).reshape(1, -1)
 
             if FAISS_AVAILABLE and self.index is not None:
-                scores, indices = self.index.search(query, k)
+                scores_2d, indices_2d = self.index.search(query, k)
+                scores_flat  = scores_2d[0]
+                indices_flat = indices_2d[0]
             elif self._numpy_store is not None:
-                # Numpy fallback: cosine similarity
                 sims = (self._numpy_store @ query.T).squeeze()
+                # C-2: atleast_1d guards against 0-d scalar when store has 1 vector
+                sims         = np.atleast_1d(sims)
                 indices_flat = np.argsort(-sims)[:k]
-                scores = np.array([sims[indices_flat]])
-                indices = np.array([indices_flat])
+                scores_flat  = sims[indices_flat]
             else:
                 return []
 
             results = []
-            for score, idx in zip(scores[0], indices[0]):
+            for score, idx in zip(scores_flat, indices_flat):
                 if 0 <= idx < len(self.chunks):
                     results.append(
                         (self.chunks[idx], float(score), self.metadata[idx])
@@ -253,24 +260,56 @@ class VectorStore:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         if FAISS_AVAILABLE and self.index is not None:
             faiss.write_index(self.index, path + ".index")
-        with open(path + ".meta", "wb") as f:
-            pickle.dump(
-                {"chunks": self.chunks, "metadata": self.metadata}, f
+        elif self._numpy_store is not None:
+            # C-1: persist numpy fallback so vectors survive a server restart
+            np.save(path + ".npy", self._numpy_store)
+        with open(path + ".meta", "w", encoding="utf-8") as f:
+            json.dump(
+                {"chunks": self.chunks, "metadata": self.metadata}, f,
+                ensure_ascii=False,
             )
-        logger.info("VectorStore saved -> %s", path)
+        logger.info("VectorStore saved -> %s (%d chunks)", path, len(self.chunks))
 
     def _load(self, path: str) -> None:
+        # W-2 / C-1: two-phase load so meta failure vs index failure are handled
+        # independently; successful FAISS index is never silently discarded.
+
+        # Phase 1 — metadata (chunks + meta JSON) — must succeed to continue
         try:
-            if FAISS_AVAILABLE:
-                self.index = faiss.read_index(path + ".index")
-            with open(path + ".meta", "rb") as f:
-                data = pickle.load(f)
-            self.chunks = data["chunks"]
+            with open(path + ".meta", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.chunks   = data["chunks"]
             self.metadata = data["metadata"]
-            logger.info("VectorStore loaded <- %s (%d chunks)", path, len(self.chunks))
-        except Exception:
-            logger.warning("Failed to load VectorStore — creating fresh.")
+        except Exception as e:
+            logger.warning(
+                "VectorStore meta load failed (%s) — creating fresh store.", e
+            )
             self._create_index()
+            return
+
+        # Phase 2 — vector index — tolerates failure; chunks are already loaded
+        try:
+            if FAISS_AVAILABLE and Path(path + ".index").exists():
+                self.index = faiss.read_index(path + ".index")
+            elif Path(path + ".npy").exists():
+                # C-1: load persisted numpy fallback store
+                self._numpy_store = np.load(path + ".npy")
+            else:
+                logger.warning(
+                    "VectorStore: no vector index found at '%s' — "
+                    "chunks loaded but retrieval disabled until re-ingestion.",
+                    path,
+                )
+        except Exception as e:
+            logger.warning(
+                "VectorStore index load failed (%s) — fresh index "
+                "(chunks from meta are intact; re-ingest to rebuild vectors).", e
+            )
+            self._create_index()
+
+        logger.info(
+            "VectorStore loaded <- %s (%d chunks)", path, len(self.chunks)
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,12 +395,34 @@ class WebSearch:
     def _fetch_page(self, url: str) -> str:
         if not WEB_AVAILABLE:
             return ""
+        # Validate URL to prevent SSRF
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return ""
+            if not parsed.hostname:
+                return ""
+            # Block private/internal network ranges
+            hostname = parsed.hostname.lower()
+            if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+                return ""
+            if hostname.startswith("10.") or hostname.startswith("192.168."):
+                return ""
+            if hostname.startswith("169.254."):
+                return ""
+            if hostname.startswith("172."):
+                parts = hostname.split(".")
+                if len(parts) >= 2 and 16 <= int(parts[1]) <= 31:
+                    return ""
+        except Exception:
+            return ""
         try:
             self._rate_limit()
             resp = requests.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=10.0,
+                allow_redirects=False,
             )
             resp.raise_for_status()
             return self._extract_text(resp.text)
