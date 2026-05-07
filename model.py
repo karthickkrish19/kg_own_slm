@@ -493,6 +493,7 @@ class SLM(nn.Module):
             config.vocab_size, config.embed_dim,
             padding_idx=config.pad_id,
         )
+        self.embed_drop = nn.Dropout(config.dropout)
 
         # ── Transformer layers ────────────────────────────────────────────────
         self.layers = nn.ModuleList([
@@ -593,7 +594,8 @@ class SLM(nn.Module):
         )
         return info
 
-    def compile(self, **kwargs) -> "SLM":
+    def torch_compile(self, **kwargs) -> "SLM":
+        """Apply torch.compile() — avoids shadowing Python's built-in compile()."""
         if not hasattr(torch, "compile"):
             logger.warning(
                 "torch.compile requires PyTorch >= 2.0 — skipped."
@@ -623,23 +625,25 @@ class SLM(nn.Module):
     def load(
         cls,
         path:         str,
-        map_location: Optional[str] = None,
+        map_location: Union[str, torch.device, None] = None,
         override:     Optional[dict] = None,
     ) -> "SLM":
+        # weights_only=True prevents arbitrary code execution from
+        # untrusted checkpoints. We allowlist only the types we need.
         ckpt  = torch.load(
             path,
             map_location = map_location or "cpu",
-            weights_only = False,
+            weights_only = True,
         )
         cfg_d = ckpt["config"]
         if override:
             cfg_d.update(override)
-        
+
         #    SLM is an nn.Module not a dataclass — cls.__dataclass_fields__ crashes
         valid_keys   = {f.name for f in fields(SLMConfig)}
         filtered_cfg = {k: v for k, v in cfg_d.items() if k in valid_keys}
         model        = cls(SLMConfig(**filtered_cfg))
-        model.load_state_dict(ckpt["model_state"])
+        model.load_state_dict(ckpt["model_state"], strict=True)
         model.eval()
         logger.info(
             "Checkpoint loaded <- %s  (params=%s)",
@@ -667,6 +671,7 @@ class SLM(nn.Module):
         )
 
         x = self.token_emb(input_ids)
+        x = self.embed_drop(x)
 
         for layer in self.layers:
             x = layer(x, start_pos=start_pos, use_cache=use_cache)
@@ -849,18 +854,23 @@ class SLM(nn.Module):
         self.eval()
         self.reset_kv_cache()
 
-        B       = idx.size(0)
-        done    = torch.zeros(B, dtype=torch.bool, device=idx.device)
-        _pad_id = pad_id if pad_id is not None else self.config.pad_id
+        B          = idx.size(0)
+        prompt_len = idx.size(1)        # track where prompt ends
+        done       = torch.zeros(B, dtype=torch.bool, device=idx.device)
+        _pad_id    = pad_id if pad_id is not None else self.config.pad_id
 
         for step in range(max_new_tokens):
-            if step == 0:
-                cur_input = idx
-                start_pos = 0
+            if self.use_kv_cache:
+                if step == 0:
+                    cur_input = idx
+                    start_pos = 0
+                else:
+                    cur_input = idx[:, -1:]
+                    start_pos = idx.size(1) - 1
             else:
-                cur_input = idx[:, -1:]
-                
-                start_pos = idx.size(1) - 1
+                # No KV cache: always pass the full (truncated) sequence
+                cur_input = idx[:, -self.config.max_seq_len:]
+                start_pos = 0
 
             logits, _, _ = self.forward(
                 cur_input,
@@ -869,8 +879,9 @@ class SLM(nn.Module):
             )
 
             next_logits = logits[:, -1, :]
+            # Only penalize newly generated tokens, not prompt tokens
             next_logits = self._apply_repetition_penalty(
-                next_logits, idx,
+                next_logits, idx[:, prompt_len:],
                 repetition_penalty, repetition_window,
             )
             next_token = self._sample(
@@ -972,13 +983,20 @@ class SLM(nn.Module):
         self.eval()
         self.reset_kv_cache()
 
+        prompt_len = idx.size(1)        # track where prompt ends
+
         for step in range(max_new_tokens):
-            if step == 0:
-                cur_input = idx
-                start_pos = 0
+            if self.use_kv_cache:
+                if step == 0:
+                    cur_input = idx
+                    start_pos = 0
+                else:
+                    cur_input = idx[:, -1:]
+                    start_pos = idx.size(1) - 1
             else:
-                cur_input = idx[:, -1:]
-                start_pos = idx.size(1) - 1
+                # No KV cache: always pass the full (truncated) sequence
+                cur_input = idx[:, -self.config.max_seq_len:]
+                start_pos = 0
 
             logits, _, _ = self.forward(
                 cur_input,
@@ -987,8 +1005,9 @@ class SLM(nn.Module):
             )
 
             next_logits = logits[:, -1, :]
+            # Only penalize newly generated tokens, not prompt tokens
             next_logits = self._apply_repetition_penalty(
-                next_logits, idx,
+                next_logits, idx[:, prompt_len:],
                 repetition_penalty, repetition_window,
             )
             next_token = self._sample(
