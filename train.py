@@ -97,28 +97,24 @@ def _get_amp_dtype(
 def _make_scaler(
     device:          torch.device,
     mixed_precision: str,
-) -> torch.cuda.amp.GradScaler:
+) -> torch.amp.GradScaler:
     
     enabled = (
         device.type == "cuda" and mixed_precision == "float16"
     )
-    try:
-        # PyTorch ≥ 2.4
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-    except TypeError:
-        # PyTorch < 2.4 fallback
-        return torch.cuda.amp.GradScaler(enabled=enabled)
+    return torch.amp.GradScaler(device.type, enabled=enabled)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate(
-    model:       nn.Module,
-    loader:      DataLoader,
-    device:      torch.device,
-    amp_dtype:   torch.dtype,
-    max_batches: int = 50,
+    model:           nn.Module,
+    loader:          DataLoader,
+    device:          torch.device,
+    amp_dtype:       torch.dtype,
+    max_batches:     int   = 50,
+    label_smoothing: float = 0.0,
 ) -> Tuple[float, float]:
     
     model.eval()
@@ -142,8 +138,9 @@ def evaluate(
                 
                 _, loss, acc = model(
                     x,
-                    targets   = y,
-                    loss_mask = loss_mask,
+                    targets         = y,
+                    loss_mask       = loss_mask,
+                    label_smoothing = label_smoothing,
                 )
 
             if loss is not None:
@@ -294,10 +291,9 @@ def main() -> None:
     )
 
     # Use full corpus for tokenizer training (better vocab coverage)
-    # Falls back to corpus_files if tokenizer_corpus_files not set
     tok_train_files = (
         cfg.tokenizer_corpus_files
-        if getattr(cfg, "tokenizer_corpus_files", None)
+        if cfg.tokenizer_corpus_files
         else cfg.corpus_files
     )
 
@@ -307,6 +303,7 @@ def main() -> None:
             files         = tok_train_files,
             vocab_size    = cfg.vocab_size,
             save_path     = tok_path,
+            min_frequency = cfg.min_frequency,
         )
     else:
         tok = SLMTokenizer(tok_path)
@@ -317,7 +314,7 @@ def main() -> None:
 
     # ── DataLoaders ───────────────────────────────────────────────────────────
     from dataset import get_dataloaders
-    val_path = "data/val.txt"
+    val_path = cfg.val_file  # W-5: sourced from config, not hardcoded
 
     train_dl, val_dl, _ = get_dataloaders(
         train_file  = train_file,
@@ -326,9 +323,11 @@ def main() -> None:
         batch_size  = cfg.batch_size,
         num_workers = cfg.num_workers,
         stride      = cfg.train_stride,
-        val_file    = val_path if Path(val_path).exists() else None,
+        val_file    = val_path if val_path and Path(val_path).exists() else None,
         seed        = cfg.seed,
         pad_id      = tok.pad_id,
+        cache_dir   = cfg.tokenized_cache_dir,  # W-6: respect config
+        pin_memory  = cfg.pin_memory,
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -397,27 +396,34 @@ def main() -> None:
             Path(cfg.model_save_dir).glob("step_*.pt"),
             key=lambda p: int(p.stem.split("_")[1]),
         )
-        if ckpts:
-            ckpt_path = ckpts[-1]
-            ckpt = torch.load(
-                ckpt_path,
-                map_location = device,
-                weights_only = False,
-            )
-            model.load_state_dict(ckpt["model_state"])
-            optimizer.load_state_dict(ckpt["optimizer_state"])
-            scaler.load_state_dict(ckpt["scaler_state"])
-            global_step = ckpt.get("step",       0)
-            start_epoch = ckpt.get("epoch",      0)
-            best_loss   = ckpt.get("best_loss",  float("inf"))
-            no_improve  = ckpt.get("no_improve", 0)
-            logger.info(
-                "Resumed <- %s  (epoch=%d step=%d best_loss=%.4f)",
-                ckpt_path, start_epoch, global_step, best_loss,
-            )
-        else:
+        resumed = False
+        for ckpt_path in reversed(ckpts):   # newest first; fall back to older on error
+            try:
+                ckpt = torch.load(
+                    ckpt_path,
+                    map_location = device,
+                    weights_only = True,
+                )
+                model.load_state_dict(ckpt["model_state"])
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+                scaler.load_state_dict(ckpt["scaler_state"])
+                global_step = ckpt.get("step",       0)
+                start_epoch = ckpt.get("epoch",      0)
+                best_loss   = ckpt.get("best_loss",  float("inf"))
+                no_improve  = ckpt.get("no_improve", 0)
+                logger.info(
+                    "Resumed <- %s  (epoch=%d step=%d best_loss=%.4f)",
+                    ckpt_path, start_epoch, global_step, best_loss,
+                )
+                resumed = True
+                break
+            except Exception as e:
+                logger.warning(
+                    "Failed to load checkpoint %s (%s) — trying older.", ckpt_path, e
+                )
+        if not resumed:
             logger.warning(
-                "No checkpoints found in %s — starting fresh.",
+                "No valid checkpoints found in %s — starting fresh.",
                 cfg.model_save_dir,
             )
 
@@ -549,7 +555,8 @@ def main() -> None:
                 # ── Evaluation ────────────────────────────────────────────────
                 if global_step % cfg.eval_every == 0 and val_dl:
                     val_loss, val_acc = evaluate(
-                        model, val_dl, device, amp_dtype
+                        model, val_dl, device, amp_dtype,
+                        label_smoothing=cfg.label_smoothing,
                     )
                     val_ppl = math.exp(min(val_loss, 88.0))  # ✅ FIX #13
 
@@ -586,13 +593,20 @@ def main() -> None:
                         )
                     else:
                         no_improve += 1
+                        patience_str = (
+                            str(cfg.early_stop_patience)
+                            if cfg.early_stop_patience is not None
+                            else "∞"
+                        )
                         logger.info(
-                            "  No improvement %d/%d",
-                            no_improve, cfg.early_stop_patience,
+                            "  No improvement %d/%s",
+                            no_improve, patience_str,
                         )
 
-                    
-                    if no_improve >= cfg.early_stop_patience:
+                    if (
+                        cfg.early_stop_patience is not None
+                        and no_improve >= cfg.early_stop_patience
+                    ):
                         logger.info(
                             "Early stopping triggered at step=%d",
                             global_step,
@@ -618,10 +632,12 @@ def main() -> None:
                         cfg.model_save_dir,
                         f"step_{global_step:07d}.pt",
                     )
-                    
+                    # W-9: always save raw (unwrapped) model state dict so
+                    # resume works regardless of whether --compile is active
+                    _raw = getattr(model, "_orig_mod", model)
                     torch.save(
                         {
-                            "model_state":     model.state_dict(),
+                            "model_state":     _raw.state_dict(),
                             "optimizer_state": optimizer.state_dict(),
                             "scaler_state":    scaler.state_dict(),
                             "step":            global_step,
