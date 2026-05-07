@@ -14,23 +14,26 @@ Usage:
   python api_server.py --config config.yaml --checkpoint out/checkpoints/best.pt
 """
 
-import os
 import sys
 import time
+import hmac
 import logging
 import argparse
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def run_api(config, checkpoint_path: str) -> None:
+def run_api(config: "Config", checkpoint_path: str) -> None:
     """Start the FastAPI server."""
     try:
-        from fastapi import FastAPI, HTTPException
+        from contextlib import asynccontextmanager
+        from fastapi import FastAPI, HTTPException, Request, Depends
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import StreamingResponse
+        from fastapi.security import APIKeyHeader
         from pydantic import BaseModel, Field
         import uvicorn
     except ImportError:
@@ -40,20 +43,77 @@ def run_api(config, checkpoint_path: str) -> None:
         )
         sys.exit(1)
 
+    engine = None
+    rag_pipeline = None
+
+    # ── Rate limiter (in-memory, per-IP) ──────────────────────────────────────
+    _rate_buckets: dict = defaultdict(list)
+
+    def _check_rate_limit(request: Request) -> None:
+        limit = config.rate_limit_per_minute
+        if limit <= 0:
+            return
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        window = _rate_buckets[client_ip]
+        # Purge entries older than 60s
+        _rate_buckets[client_ip] = [t for t in window if now - t < 60.0]
+        if not _rate_buckets[client_ip]:
+            del _rate_buckets[client_ip]
+            return
+        if len(_rate_buckets[client_ip]) >= limit:
+            raise HTTPException(429, "Rate limit exceeded")
+        _rate_buckets[client_ip].append(now)
+
+    # ── API key authentication ────────────────────────────────────────────────
+    _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+    async def _verify_api_key(
+        api_key: Optional[str] = Depends(_api_key_header),
+    ) -> None:
+        if config.api_key is None:
+            return  # No key configured → open access
+        if api_key is None:
+            raise HTTPException(401, "Missing API key")
+        if not hmac.compare_digest(api_key, config.api_key):
+            raise HTTPException(403, "Invalid API key")
+
+    # ── Lifespan (replaces deprecated @app.on_event("startup")) ──────────────
+    @asynccontextmanager
+    async def lifespan(app_: FastAPI):
+        nonlocal engine, rag_pipeline
+        from inference import SLMInference
+
+        engine = SLMInference(config, checkpoint_path)
+        logger.info("API engine loaded.")
+
+        if config.rag_enabled:
+            from rag import RAGPipeline
+
+            rag_pipeline = RAGPipeline(
+                config,
+                engine.model,
+                engine.tok,
+                engine.device,
+            )
+            logger.info("RAG pipeline loaded.")
+        yield
+
     app = FastAPI(
         title="SLM API",
         version="1.0",
         description="Small Language Model — Production API",
-    )
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        lifespan=lifespan,
     )
 
-    engine = None
-    rag_pipeline = None
+    # ── CORS — configurable origins ───────────────────────────────────────────
+    cors_origins = getattr(config, "api_cors_origins", ["http://localhost:3000"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    )
 
     # ── Request / Response models ─────────────────────────────────────────────
     class GenerateRequest(BaseModel):
@@ -93,26 +153,6 @@ def run_api(config, checkpoint_path: str) -> None:
         context_used: str
         elapsed_ms: float
 
-    # ── Startup ───────────────────────────────────────────────────────────────
-    @app.on_event("startup")
-    async def startup():
-        nonlocal engine, rag_pipeline
-        from inference import SLMInference
-
-        engine = SLMInference(config, checkpoint_path)
-        logger.info("API engine loaded.")
-
-        if config.rag_enabled:
-            from rag import RAGPipeline
-
-            rag_pipeline = RAGPipeline(
-                config,
-                engine.model,
-                engine.tok,
-                engine.device,
-            )
-            logger.info("RAG pipeline loaded.")
-
     # ── Health ────────────────────────────────────────────────────────────────
     @app.get("/health")
     async def health():
@@ -122,8 +162,9 @@ def run_api(config, checkpoint_path: str) -> None:
         }
 
     # ── Generate ──────────────────────────────────────────────────────────────
-    @app.post("/generate")
-    async def generate_endpoint(req: GenerateRequest):
+    @app.post("/generate", dependencies=[Depends(_verify_api_key)])
+    async def generate_endpoint(req: GenerateRequest, request: Request):
+        _check_rate_limit(request)
         if engine is None:
             raise HTTPException(503, "Model not loaded")
 
@@ -133,11 +174,12 @@ def run_api(config, checkpoint_path: str) -> None:
             async def stream_gen():
                 for chunk in engine.stream(
                     req.prompt,
-                    req.max_new_tokens,
-                    req.temperature,
-                    req.top_k,
-                    req.top_p,
-                    req.context,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    repetition_penalty=req.repetition_penalty,
+                    context=req.context,
                 ):
                     yield chunk
 
@@ -161,8 +203,9 @@ def run_api(config, checkpoint_path: str) -> None:
         )
 
     # ── Embed ─────────────────────────────────────────────────────────────────
-    @app.post("/embed", response_model=EmbedResponse)
-    async def embed_endpoint(req: EmbedRequest):
+    @app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(_verify_api_key)])
+    async def embed_endpoint(req: EmbedRequest, request: Request):
+        _check_rate_limit(request)
         if engine is None:
             raise HTTPException(503, "Model not loaded")
         emb = engine.embed(req.texts, pooling=req.pooling)
@@ -172,16 +215,18 @@ def run_api(config, checkpoint_path: str) -> None:
         )
 
     # ── RAG Ingest ────────────────────────────────────────────────────────────
-    @app.post("/rag/ingest")
-    async def rag_ingest_endpoint(req: RAGIngestRequest):
+    @app.post("/rag/ingest", dependencies=[Depends(_verify_api_key)])
+    async def rag_ingest_endpoint(req: RAGIngestRequest, request: Request):
+        _check_rate_limit(request)
         if rag_pipeline is None:
             raise HTTPException(503, "RAG not enabled")
         n_chunks = rag_pipeline.ingest_documents(req.texts)
         return {"status": "ok", "chunks_ingested": n_chunks}
 
     # ── RAG Query ─────────────────────────────────────────────────────────────
-    @app.post("/rag/query", response_model=RAGQueryResponse)
-    async def rag_query_endpoint(req: RAGQueryRequest):
+    @app.post("/rag/query", response_model=RAGQueryResponse, dependencies=[Depends(_verify_api_key)])
+    async def rag_query_endpoint(req: RAGQueryRequest, request: Request):
+        _check_rate_limit(request)
         if rag_pipeline is None:
             raise HTTPException(503, "RAG not enabled")
         if engine is None:
