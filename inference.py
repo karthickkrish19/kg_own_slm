@@ -17,7 +17,7 @@ import math
 import re
 import logging
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Generator, List, Optional, Union
 
 import torch
 
@@ -125,8 +125,8 @@ class SLMInference:
         rp = repetition_penalty if repetition_penalty is not None else self.cfg.repetition_penalty
         rw = repetition_window if repetition_window is not None else self.cfg.repetition_window
 
-        max_ctx = max(8, self.cfg.block_size - max_new)
-        ids = self._encode_prompt(prompt, context, max_len=max_ctx)
+        # Use full block_size as context — generate() handles its own windowing
+        ids = self._encode_prompt(prompt, context, max_len=self.cfg.block_size)
 
         # Use EOS for natural stopping if config says so
         eos_id = self.tok.eos_id if getattr(self.cfg, 'stop_at_eos', False) else None
@@ -158,19 +158,23 @@ class SLMInference:
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        repetition_window: Optional[int] = None,
         context: Optional[str] = None,
-    ):
+    ) -> Generator[str, None, None]:
         if not self._is_safe(prompt):
             yield "[Content filtered]"
             return
 
         max_new = max_new_tokens or self.cfg.max_new_tokens
         temp = temperature if temperature is not None else self.cfg.temperature
-        tk = top_k if top_k is not None else self.cfg.top_k
-        tp = top_p if top_p is not None else self.cfg.top_p
+        tk   = top_k if top_k is not None else self.cfg.top_k
+        tp   = top_p if top_p is not None else self.cfg.top_p
+        rp   = repetition_penalty if repetition_penalty is not None else self.cfg.repetition_penalty
+        rw   = repetition_window  if repetition_window  is not None else self.cfg.repetition_window
 
-        max_ctx = max(8, self.cfg.block_size - max_new)
-        ids = self._encode_prompt(prompt, context, max_len=max_ctx)
+        # Use full block_size as context — generate() handles its own windowing
+        ids = self._encode_prompt(prompt, context, max_len=self.cfg.block_size)
 
         eos_id = self.tok.eos_id if getattr(self.cfg, 'stop_at_eos', False) else None
 
@@ -180,6 +184,8 @@ class SLMInference:
             temperature=temp,
             top_k=tk,
             top_p=tp,
+            repetition_penalty=rp,
+            repetition_window=rw,
             eos_id=eos_id,
         ):
             token_text = self.tok.decode([token_id], skip_special=True)
@@ -226,4 +232,6 @@ class SLMInference:
         x = torch.tensor([ids[:-1]], dtype=torch.long, device=self.device)
         y = torch.tensor([ids[1:]], dtype=torch.long, device=self.device)
         _, loss, _ = self.model(x, targets=y)
+        if loss is None:          # M-10: guard against unexpected None
+            return float("inf")
         return math.exp(min(loss.item(), 88.0))
