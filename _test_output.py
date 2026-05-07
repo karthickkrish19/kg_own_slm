@@ -4,11 +4,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from inference import SLMInference
 from config import Config
-import yaml
 
-with open('config.yaml') as f:
-    ov = yaml.safe_load(f)
-cfg = Config(**{k: v for k, v in ov.items() if hasattr(Config, k)})
+cfg = Config.from_yaml('config.yaml')
 inf = SLMInference(cfg, 'out/checkpoints/best_model.pt', device='cpu')
 
 prompts = [
