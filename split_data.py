@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk_step", type=int,   default=DEFAULT_CHUNK_STEP, help="char-mode step")
     p.add_argument("--no_shuffle", action="store_true", help="disable shuffle")
     p.add_argument("--dedupe",     action="store_true", help="deduplicate chunks")
+    p.add_argument("--no_unicode", action="store_true", help="strip non-ASCII characters")
     p.add_argument("--mode",       choices=["auto","paragraph","line","character"],
                    default="auto", help="split mode override")
     p.add_argument("--config",     default="config.yaml", help="config.yaml path")
@@ -119,6 +120,21 @@ def clean_text(text: str, keep_unicode: bool = True) -> str:
 
     # Collapse 3+ blank lines → 2
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # ── Unwrap hard-wrapped lines ─────────────────────────────────────────
+    # Many Project Gutenberg texts (and similar corpora) are hard-wrapped
+    # at ~70 chars.  These '\n' are formatting artifacts — not real
+    # paragraph breaks.  Unwrap them to produce flowing prose so the
+    # tokenizer doesn't waste capacity on thousands of newline tokens.
+    #
+    # Strategy: protect real paragraph breaks (\n\n), then replace every
+    # remaining single \n with a space.
+    _PARA = "\x00PARA\x00"
+    text = text.replace("\n\n", _PARA)   # protect paragraph boundaries
+    text = text.replace("\n", " ")       # unwrap hard wraps
+    text = text.replace(_PARA, "\n\n")   # restore paragraph boundaries
+    text = re.sub(r" {2,}", " ", text)   # collapse double-spaces
+
     return text.strip()
 
 
@@ -472,100 +488,119 @@ def split_data(
         mode = corpus_stats["split_mode"]
     logger.info("Using split mode: %s", mode)
 
-    # ── Chunk ─────────────────────────────────────────────────────────────────
-    chunks = split_into_chunks(
-        text, mode,
-        min_len    = min_len,     # ✅ FIX #15
-        chunk_size = chunk_size,  # ✅ FIX #2
-        chunk_step = chunk_step,
-    )
+    # ──────────────────────────────────────────────────────────────────────────
+    # SPLIT STRATEGY: Per-book contiguous split
+    # ──────────────────────────────────────────────────────────────────────────
+    # Split the raw text into large contiguous blocks (books), then take
+    # train/val/test slices from EACH book.  This ensures:
+    #   1. All splits see all books (balanced distribution)
+    #   2. Within each split, text is CONTIGUOUS (no broken sentences)
+    #   3. No line-level fragmentation or "every Nth" gaps
+    #
+    # Books are detected by large gaps (double+ newlines) or by the
+    # entire text being treated as one block if no gaps exist.
+    # ──────────────────────────────────────────────────────────────────────────
+    books = re.split(r"\n\s*\n", text)
+    books = [b.strip() for b in books if len(b.strip()) >= 200]
 
-    # ── Deduplicate ───────────────────────────────────────────────────────────
-    n_dupes = 0
-    if dedupe:
-        chunks, n_dupes = deduplicate(chunks)
+    # If no blank-line separators found, treat entire text as one book
+    if len(books) <= 1:
+        books = [text.strip()]
 
-    total = len(chunks)
+    logger.info("Detected %d book(s) / section(s)", len(books))
 
-    # ✅ FIX #7: guard minimum corpus size
-    min_required = 30
-    if total < min_required:
-        raise ValueError(
-            f"Only {total} chunks after cleaning (need ≥ {min_required}).\n"
-            "Possible causes:\n"
-            f"  - File too small\n"
-            f"  - min_len={min_len} too high (try --min_len 20)\n"
-            f"  - Wrong split mode (try --mode line or --mode character)"
+    train_parts = []
+    val_parts   = []
+    test_parts  = []
+
+    for i, book in enumerate(books):
+        n = len(book)
+        # Take contiguous slices from each book:
+        #   train = first 80%
+        #   val   = next 10%
+        #   test  = last 10%
+        train_end = int(n * train_ratio)
+        val_end   = int(n * (train_ratio + val_ratio))
+
+        train_text = book[:train_end].strip()
+        val_text   = book[train_end:val_end].strip()
+        test_text  = book[val_end:].strip()
+
+        if train_text:
+            train_parts.append(train_text)
+        if val_text:
+            val_parts.append(val_text)
+        if test_text:
+            test_parts.append(test_text)
+
+        logger.info(
+            "  Book %d: %s chars -> train=%s val=%s test=%s",
+            i + 1, f"{n:,}",
+            f"{len(train_text):,}",
+            f"{len(val_text):,}",
+            f"{len(test_text):,}",
         )
 
-    # ✅ FIX #10: guard val / test could be empty
-    n_val  = max(1, math.floor(total * val_ratio))  if val_ratio  > 0 else 0
-    n_test = max(1, math.floor(total * test_ratio)) if test_ratio > 0 else 0
-    n_train= total - n_val - n_test
+    # Join all books' splits with double-newline separator
+    train_full = "\n\n".join(train_parts)
+    val_full   = "\n\n".join(val_parts)
+    test_full  = "\n\n".join(test_parts)
 
-    if n_train < 10:
-        raise ValueError(
-            f"train set would have only {n_train} chunks.\n"
-            "Use a larger corpus or reduce val/test ratios."
-        )
-
+    total_chars = len(train_full) + len(val_full) + len(test_full)
     logger.info(
-        "Chunks total=%d | train=%d  val=%d  test=%d",
-        total, n_train, n_val, n_test,
+        "Total: train=%s val=%s test=%s chars",
+        f"{len(train_full):,}", f"{len(val_full):,}", f"{len(test_full):,}",
     )
-
-    # ── Shuffle ───────────────────────────────────────────────────────────────
-    if shuffle:
-        random.seed(seed)
-        random.shuffle(chunks)
-        logger.info("Shuffled with seed=%d", seed)
-
-    # ── Split ─────────────────────────────────────────────────────────────────
-    train_chunks = chunks[: n_train]
-    val_chunks   = chunks[n_train : n_train + n_val]
-    test_chunks  = chunks[n_train + n_val :]
-
-    # ── Leakage check ─────────────────────────────────────────────────────────
-    check_leakage(train_chunks, val_chunks, test_chunks)
 
     # ── Write files ───────────────────────────────────────────────────────────
     train_path = os.path.join(output_dir, "train.txt")
     val_path   = os.path.join(output_dir, "val.txt")
     test_path  = os.path.join(output_dir, "test.txt")
 
-    write_file(train_path, train_chunks, mode)
-    write_file(val_path,   val_chunks,   mode)
-    write_file(test_path,  test_chunks,  mode)
+    Path(train_path).write_text(train_full, encoding="utf-8")
+    Path(val_path).write_text(val_full, encoding="utf-8")
+    Path(test_path).write_text(test_full, encoding="utf-8")
+
+    logger.info("Written -> %s  (%s bytes)", train_path, f"{len(train_full.encode('utf-8')):,}")
+    logger.info("Written -> %s  (%s bytes)", val_path, f"{len(val_full.encode('utf-8')):,}")
+    logger.info("Written -> %s  (%s bytes)", test_path, f"{len(test_full.encode('utf-8')):,}")
 
     # ── Log stats ─────────────────────────────────────────────────────────────
-    _log_split_stats(train_chunks, val_chunks, test_chunks)
+    sep = "=" * 58
+    logger.info("\n%s", sep)
+    logger.info("  SPLIT RESULTS (per-book contiguous)")
+    logger.info(sep)
+    for name, txt in [("train.txt", train_full),
+                       ("val.txt",   val_full),
+                       ("test.txt",  test_full)]:
+        words = len(txt.split())
+        chars = len(txt)
+        pct   = chars / max(total_chars, 1) * 100
+        logger.info(
+            "  %-12s  words=%9s  chars=%11s  (%.1f%%)",
+            name, f"{words:,}", f"{chars:,}", pct,
+        )
+    logger.info(sep)
 
     # ── Save report ───────────────────────────────────────────────────────────
-    # ✅ FIX #14: full stats saved to JSON
     report = {
         "input_file":     str(input_path.resolve()),
         "file_size_bytes":file_size,
-        "split_mode":     mode,
-        "seed":           seed,
-        "shuffle":        shuffle,
-        "dedupe":         dedupe,
-        "n_dupes_removed":n_dupes,
-        "min_len":        min_len,
-        "chunk_size":     chunk_size,
-        "chunk_step":     chunk_step,
+        "split_mode":     "per-book-contiguous",
+        "n_books":        len(books),
         "corpus_stats":   {
             k: v for k, v in corpus_stats.items()
             if k not in ("top_words", "top_chars")
         },
         "splits": {
-            "train": {**_chunk_stats(train_chunks), "path": train_path},
-            "val":   {**_chunk_stats(val_chunks),   "path": val_path},
-            "test":  {**_chunk_stats(test_chunks),  "path": test_path},
+            "train": {"chars": len(train_full), "words": len(train_full.split()), "path": train_path},
+            "val":   {"chars": len(val_full),   "words": len(val_full.split()),   "path": val_path},
+            "test":  {"chars": len(test_full),  "words": len(test_full.split()),  "path": test_path},
         },
         "ratios": {
-            "train": round(len(train_chunks) / total, 4),
-            "val":   round(len(val_chunks)   / total, 4),
-            "test":  round(len(test_chunks)  / total, 4),
+            "train": round(len(train_full) / max(total_chars, 1), 4),
+            "val":   round(len(val_full)   / max(total_chars, 1), 4),
+            "test":  round(len(test_full)  / max(total_chars, 1), 4),
         },
     }
     report_path = os.path.join(output_dir, "split_report.json")
@@ -602,7 +637,9 @@ if __name__ == "__main__":
             # Only use corpus_files from config if --input was NOT explicitly given
             if args.input == DEFAULT_INPUT:
                 cfg_input  = cfg.get("corpus_files", [cfg_input])[0]
-            cfg_output_dir = "data"
+            # W-10: only override output_dir from config when user didn't set it
+            if args.output_dir == DEFAULT_OUTPUT_DIR:
+                cfg_output_dir = "data"
             logger.info(
                 "Config loaded: %s  (seed=%d input=%s)",
                 args.config, cfg_seed, cfg_input,
@@ -623,5 +660,5 @@ if __name__ == "__main__":
         chunk_size  = args.chunk_size,
         chunk_step  = args.chunk_step,
         mode        = args.mode,
-        keep_unicode= True,
+        keep_unicode= not args.no_unicode,
     )
